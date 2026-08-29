@@ -1,0 +1,11 @@
+﻿venv/
+__pycache__/
+*.pyc
+.env
+app/credentials/
+*.json
+!package.json
+.vscode/
+*.log
+
+*.db
