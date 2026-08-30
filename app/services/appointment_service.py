@@ -1,3 +1,4 @@
+import logging
 import threading
 import httpx
 from datetime import datetime, timedelta
@@ -8,10 +9,24 @@ from app.models.appointment import Appointment, CallLog
 from app.integrations.factory import calendar_provider, logging_provider
 from app.config import settings
 
+logger = logging.getLogger("uvicorn.error")
+
 # Simple in-process lock to prevent double-booking during concurrent requests.
 _booking_lock = threading.Lock()
 
-APPOINTMENT_WEBHOOK_URL = "http://localhost:5678/webhook/appointment-booked"
+# Prefer webhook URLs from .env (see README) — fall back to localhost defaults
+# so existing setups keep working even if the .env keys aren't set yet.
+APPOINTMENT_WEBHOOK_URL = getattr(
+    settings, "N8N_APPOINTMENT_WEBHOOK_URL", "http://localhost:5678/webhook/appointment-booked"
+)
+CALL_SUMMARY_WEBHOOK_URL = getattr(
+    settings, "N8N_CALL_SUMMARY_WEBHOOK_URL", "http://localhost:5678/webhook/call-summary"
+)
+
+
+class CalendarUnavailableError(Exception):
+    """Raised when the calendar provider (Google Calendar) fails or is unreachable."""
+    pass
 
 
 def _localize(dt: datetime) -> datetime:
@@ -22,30 +37,51 @@ def _localize(dt: datetime) -> datetime:
     return dt.astimezone(tz)
 
 
-def _send_appointment_log(appointment, status: str):
+def _send_webhook(url: str, payload: dict, label: str):
+    """Best-effort POST to an n8n webhook. Never raises — a down n8n instance
+    should never block a booking/cancellation/call-summary from succeeding."""
     try:
         with httpx.Client(timeout=5.0) as client:
-            client.post(
-                APPOINTMENT_WEBHOOK_URL,
-                json={
-                    "appointment_id": str(appointment.id),
-                    "patient_name": appointment.patient_id,
-                    "appointment_type": appointment.appointment_type,
-                    "start_time": str(appointment.start_time),
-                    "status": status,
-                    "timestamp": datetime.utcnow().isoformat(),
-                },
-            )
+            response = client.post(url, json=payload)
+            response.raise_for_status()
+            logger.info(f"n8n {label} webhook delivered successfully ({url})")
+    except httpx.TimeoutException:
+        logger.warning(f"n8n {label} webhook timed out ({url}) — Sheets log was NOT created, but the operation itself succeeded.")
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"n8n {label} webhook returned {e.response.status_code} ({url}) — Sheets log may not have been created.")
+    except httpx.RequestError as e:
+        logger.warning(f"n8n {label} webhook unreachable ({url}): {e} — is n8n running? Sheets log was NOT created.")
     except Exception as e:
-        print(f"n8n ko appointment log bhejne mein masla: {e}")
+        logger.warning(f"Unexpected error sending n8n {label} webhook: {e}")
+
+
+def _send_appointment_log(appointment, status: str):
+    _send_webhook(
+        APPOINTMENT_WEBHOOK_URL,
+        {
+            "appointment_id": str(appointment.id),
+            "patient_name": appointment.patient_id,
+            "appointment_type": appointment.appointment_type,
+            "start_time": str(appointment.start_time),
+            "status": status,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        label="appointment log",
+    )
 
 
 def get_available_slots(date: datetime, provider: str = None):
-    return calendar_provider.get_available_slots(
-        date=date,
-        duration_minutes=settings.APPOINTMENT_DURATION_MIN,
-        provider=provider,
-    )
+    try:
+        return calendar_provider.get_available_slots(
+            date=date,
+            duration_minutes=settings.APPOINTMENT_DURATION_MIN,
+            provider=provider,
+        )
+    except Exception as e:
+        logger.error(f"Calendar error while fetching available slots for {date}: {e}", exc_info=True)
+        raise CalendarUnavailableError(
+            "Could not check calendar availability right now. Please try again in a moment."
+        )
 
 
 def book_appointment(
@@ -59,37 +95,61 @@ def book_appointment(
     end_time = start_time + timedelta(minutes=settings.APPOINTMENT_DURATION_MIN)
 
     with _booking_lock:
-        free_slots = calendar_provider.get_available_slots(
-            date=start_time, duration_minutes=settings.APPOINTMENT_DURATION_MIN
-        )
+        try:
+            free_slots = calendar_provider.get_available_slots(
+                date=start_time, duration_minutes=settings.APPOINTMENT_DURATION_MIN
+            )
+        except Exception as e:
+            logger.error(f"Calendar error while checking slot availability: {e}", exc_info=True)
+            raise CalendarUnavailableError("Could not verify calendar availability right now. Please try again shortly.")
+
         slot_still_free = any(s["start"] == start_time for s in free_slots)
         if not slot_still_free:
             raise ValueError("Requested slot is no longer available")
 
-        event_id = calendar_provider.create_event(
-            start=start_time, end=end_time, title=f"{appointment_type} - Patient {patient_id}"
-        )
+        try:
+            event_id = calendar_provider.create_event(
+                start=start_time, end=end_time, title=f"{appointment_type} - Patient {patient_id}"
+            )
+        except Exception as e:
+            logger.error(f"Calendar error while creating event for patient {patient_id}: {e}", exc_info=True)
+            raise CalendarUnavailableError("Could not create the calendar event right now. Please try again shortly.")
 
-        appointment = Appointment(
-            patient_id=patient_id,
-            appointment_type=appointment_type,
-            provider=provider,
-            start_time=start_time,
-            end_time=end_time,
-            status="confirmed",
-            external_event_id=event_id,
-        )
-        db.add(appointment)
-        db.commit()
-        db.refresh(appointment)
+        try:
+            appointment = Appointment(
+                patient_id=patient_id,
+                appointment_type=appointment_type,
+                provider=provider,
+                start_time=start_time,
+                end_time=end_time,
+                status="confirmed",
+                external_event_id=event_id,
+            )
+            db.add(appointment)
+            db.commit()
+            db.refresh(appointment)
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Database error while saving appointment for patient {patient_id}: {e}", exc_info=True)
+            # The calendar event was already created — best effort to undo it so we don't leave an orphaned event.
+            try:
+                calendar_provider.cancel_event(event_id)
+            except Exception as cleanup_error:
+                logger.error(f"Failed to roll back orphaned calendar event {event_id}: {cleanup_error}")
+            raise ValueError("Could not save the appointment. Please try again.")
 
-    logging_provider.log_appointment({
-        "patient_id": patient_id,
-        "appointment_id": appointment.id,
-        "start_time": str(start_time),
-        "type": appointment_type,
-        "status": "confirmed",
-    })
+    logger.info(f"Appointment {appointment.id} booked for patient {patient_id} at {start_time}")
+
+    try:
+        logging_provider.log_appointment({
+            "patient_id": patient_id,
+            "appointment_id": appointment.id,
+            "start_time": str(start_time),
+            "type": appointment_type,
+            "status": "confirmed",
+        })
+    except Exception as e:
+        logger.warning(f"logging_provider.log_appointment failed (non-fatal): {e}")
 
     _send_appointment_log(appointment, "confirmed")
 
@@ -106,27 +166,46 @@ def reschedule_appointment(db: Session, appointment_id: str, new_start_time: dat
     new_end_time = new_start_time + timedelta(minutes=settings.APPOINTMENT_DURATION_MIN)
 
     with _booking_lock:
-        free_slots = calendar_provider.get_available_slots(
-            date=new_start_time, duration_minutes=settings.APPOINTMENT_DURATION_MIN
-        )
+        try:
+            free_slots = calendar_provider.get_available_slots(
+                date=new_start_time, duration_minutes=settings.APPOINTMENT_DURATION_MIN
+            )
+        except Exception as e:
+            logger.error(f"Calendar error while checking new slot for appointment {appointment_id}: {e}", exc_info=True)
+            raise CalendarUnavailableError("Could not verify calendar availability right now. Please try again shortly.")
+
         slot_still_free = any(s["start"] == new_start_time for s in free_slots)
         if not slot_still_free:
             raise ValueError("Requested new slot is not available")
 
         if appointment.external_event_id:
-            calendar_provider.update_event(appointment.external_event_id, new_start_time, new_end_time)
+            try:
+                calendar_provider.update_event(appointment.external_event_id, new_start_time, new_end_time)
+            except Exception as e:
+                logger.error(f"Calendar error while updating event for appointment {appointment_id}: {e}", exc_info=True)
+                raise CalendarUnavailableError("Could not update the calendar event right now. Please try again shortly.")
 
-        appointment.start_time = new_start_time
-        appointment.end_time = new_end_time
-        appointment.status = "rescheduled"
-        db.commit()
-        db.refresh(appointment)
+        try:
+            appointment.start_time = new_start_time
+            appointment.end_time = new_end_time
+            appointment.status = "rescheduled"
+            db.commit()
+            db.refresh(appointment)
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Database error while rescheduling appointment {appointment_id}: {e}", exc_info=True)
+            raise ValueError("Could not save the rescheduled appointment. Please try again.")
 
-    logging_provider.log_appointment({
-        "appointment_id": appointment.id,
-        "new_start_time": str(new_start_time),
-        "status": "rescheduled",
-    })
+    logger.info(f"Appointment {appointment.id} rescheduled to {new_start_time}")
+
+    try:
+        logging_provider.log_appointment({
+            "appointment_id": appointment.id,
+            "new_start_time": str(new_start_time),
+            "status": "rescheduled",
+        })
+    except Exception as e:
+        logger.warning(f"logging_provider.log_appointment failed (non-fatal): {e}")
 
     _send_appointment_log(appointment, "rescheduled")
 
@@ -139,16 +218,32 @@ def cancel_appointment(db: Session, appointment_id: str):
         raise ValueError("Appointment not found")
 
     if appointment.external_event_id:
-        calendar_provider.cancel_event(appointment.external_event_id)
+        try:
+            calendar_provider.cancel_event(appointment.external_event_id)
+        except Exception as e:
+            # Log it, but don't block the cancellation in our own system just because
+            # the calendar cleanup failed — a stale calendar event is far less harmful
+            # than telling the patient their cancellation didn't go through.
+            logger.error(f"Calendar error while cancelling event for appointment {appointment_id}: {e}", exc_info=True)
 
-    appointment.status = "cancelled"
-    db.commit()
-    db.refresh(appointment)
+    try:
+        appointment.status = "cancelled"
+        db.commit()
+        db.refresh(appointment)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Database error while cancelling appointment {appointment_id}: {e}", exc_info=True)
+        raise ValueError("Could not save the cancellation. Please try again.")
 
-    logging_provider.log_appointment({
-        "appointment_id": appointment.id,
-        "status": "cancelled",
-    })
+    logger.info(f"Appointment {appointment.id} cancelled")
+
+    try:
+        logging_provider.log_appointment({
+            "appointment_id": appointment.id,
+            "status": "cancelled",
+        })
+    except Exception as e:
+        logger.warning(f"logging_provider.log_appointment failed (non-fatal): {e}")
 
     _send_appointment_log(appointment, "cancelled")
 
@@ -165,41 +260,48 @@ def save_call_summary(
     outcome: str = None,
     appointment_created: str = None,
 ):
-    call_log = CallLog(
-        call_id=call_id,
-        caller_number=caller_number,
-        patient_id=patient_id,
-        call_reason=call_reason,
-        summary=summary,
-        outcome=outcome,
-        appointment_created=appointment_created,
-    )
-    db.add(call_log)
-    db.commit()
-    db.refresh(call_log)
+    try:
+        call_log = CallLog(
+            call_id=call_id,
+            caller_number=caller_number,
+            patient_id=patient_id,
+            call_reason=call_reason,
+            summary=summary,
+            outcome=outcome,
+            appointment_created=appointment_created,
+        )
+        db.add(call_log)
+        db.commit()
+        db.refresh(call_log)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Database error while saving call summary for call {call_id}: {e}", exc_info=True)
+        raise ValueError("Could not save the call summary. Please try again.")
 
-    logging_provider.log_call_summary({
-        "call_id": call_id,
-        "summary": summary,
-        "outcome": outcome,
-    })
+    logger.info(f"Call summary saved for call {call_id} (outcome: {outcome})")
 
     try:
-        with httpx.Client(timeout=5.0) as client:
-            client.post(
-                "http://localhost:5678/webhook/call-summary",
-                json={
-                    "call_id": call_id,
-                    "caller_number": caller_number,
-                    "patient_name": patient_id,
-                    "call_reason": call_reason,
-                    "summary": summary,
-                    "outcome": outcome,
-                    "appointment_created": appointment_created,
-                    "timestamp": datetime.utcnow().isoformat(),
-                },
-            )
+        logging_provider.log_call_summary({
+            "call_id": call_id,
+            "summary": summary,
+            "outcome": outcome,
+        })
     except Exception as e:
-        print(f"n8n ko call summary bhejne mein masla: {e}")
+        logger.warning(f"logging_provider.log_call_summary failed (non-fatal): {e}")
+
+    _send_webhook(
+        CALL_SUMMARY_WEBHOOK_URL,
+        {
+            "call_id": call_id,
+            "caller_number": caller_number,
+            "patient_name": patient_id,
+            "call_reason": call_reason,
+            "summary": summary,
+            "outcome": outcome,
+            "appointment_created": appointment_created,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        label="call summary",
+    )
 
     return call_log

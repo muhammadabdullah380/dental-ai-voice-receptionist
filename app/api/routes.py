@@ -2,13 +2,13 @@ import json
 import logging
 from datetime import datetime
 from typing import Optional
-
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.services import appointment_service, patient_service
+from app.services.appointment_service import CalendarUnavailableError
 from app.config import settings
 
 router = APIRouter()
@@ -81,6 +81,20 @@ async def parse_and_validate(request: Request, schema: type[BaseModel]):
     return tool_call_id, validated, None
 
 
+def handle_tool_error(tool_name: str, tool_call_id: str, e: Exception):
+    """Central place to log an unexpected tool failure and build a safe,
+    caller-friendly response instead of letting the request crash with a 500."""
+    if isinstance(e, CalendarUnavailableError):
+        logger.warning(f"[{tool_name}] calendar unavailable: {e}")
+        return vapi_result(tool_call_id, str(e))
+
+    logger.error(f"[{tool_name}] unexpected error: {e}", exc_info=True)
+    return vapi_result(
+        tool_call_id,
+        "Sorry, something went wrong on our end handling that request. Please try again in a moment.",
+    )
+
+
 # ---------- Schemas ----------
 
 class SlotsRequest(BaseModel):
@@ -115,7 +129,7 @@ class GetPatientRequest(BaseModel):
 
 
 class CallSummaryRequest(BaseModel):
-    call_id: str
+    call_id: Optional[str] = None
     caller_number: Optional[str] = None
     patient_id: Optional[str] = None
     call_reason: Optional[str] = None
@@ -132,8 +146,12 @@ async def get_available_slots(request: Request):
     if error:
         return vapi_result(tool_call_id, error)
 
-    slots = appointment_service.get_available_slots(date=req.date, provider=req.provider)
-    return vapi_result(tool_call_id, {"slots": slots})
+    try:
+        slots = appointment_service.get_available_slots(date=req.date, provider=req.provider)
+        logger.info(f"get_available_slots: returned {len(slots)} slot(s) for {req.date}")
+        return vapi_result(tool_call_id, {"slots": slots})
+    except Exception as e:
+        return handle_tool_error("get_available_slots", tool_call_id, e)
 
 
 # ---------- Tool 2: book_appointment ----------
@@ -158,7 +176,10 @@ async def book_appointment(request: Request, db: Session = Depends(get_db)):
             "status": appointment.status,
         })
     except ValueError as e:
+        logger.warning(f"book_appointment rejected: {e}")
         return vapi_result(tool_call_id, f"Could not book appointment: {e}")
+    except Exception as e:
+        return handle_tool_error("book_appointment", tool_call_id, e)
 
 
 # ---------- Tool 3: reschedule_appointment ----------
@@ -179,7 +200,10 @@ async def reschedule_appointment(request: Request, db: Session = Depends(get_db)
             "status": appointment.status,
         })
     except ValueError as e:
+        logger.warning(f"reschedule_appointment rejected: {e}")
         return vapi_result(tool_call_id, f"Could not reschedule appointment: {e}")
+    except Exception as e:
+        return handle_tool_error("reschedule_appointment", tool_call_id, e)
 
 
 # ---------- Tool 4: cancel_appointment ----------
@@ -198,7 +222,10 @@ async def cancel_appointment(request: Request, db: Session = Depends(get_db)):
             "status": appointment.status,
         })
     except ValueError as e:
+        logger.warning(f"cancel_appointment rejected: {e}")
         return vapi_result(tool_call_id, f"Could not cancel appointment: {e}")
+    except Exception as e:
+        return handle_tool_error("cancel_appointment", tool_call_id, e)
 
 
 # ---------- Tool 5: get_patient ----------
@@ -209,15 +236,19 @@ async def get_patient(request: Request, db: Session = Depends(get_db)):
     if error:
         return vapi_result(tool_call_id, error)
 
-    patient = patient_service.get_patient_by_phone(db, req.phone_number)
-    if not patient:
-        return vapi_result(tool_call_id, "No patient found with that phone number.")
+    try:
+        patient = patient_service.get_patient_by_phone(db, req.phone_number)
+        if not patient:
+            logger.info(f"get_patient: no patient found for {req.phone_number}")
+            return vapi_result(tool_call_id, "No patient found with that phone number.")
 
-    return vapi_result(tool_call_id, {
-        "id": patient.id,
-        "name": patient.name,
-        "phone_number": patient.phone_number,
-    })
+        return vapi_result(tool_call_id, {
+            "id": patient.id,
+            "name": patient.name,
+            "phone_number": patient.phone_number,
+        })
+    except Exception as e:
+        return handle_tool_error("get_patient", tool_call_id, e)
 
 
 # ---------- Tool 6: create_patient ----------
@@ -228,12 +259,16 @@ async def create_patient(request: Request, db: Session = Depends(get_db)):
     if error:
         return vapi_result(tool_call_id, error)
 
-    patient = patient_service.create_patient(db, req.name, req.phone_number, req.email)
-    return vapi_result(tool_call_id, {
-        "id": patient.id,
-        "name": patient.name,
-        "phone_number": patient.phone_number,
-    })
+    try:
+        patient = patient_service.create_patient(db, req.name, req.phone_number, req.email)
+        logger.info(f"create_patient: created patient {patient.id} ({req.phone_number})")
+        return vapi_result(tool_call_id, {
+            "id": patient.id,
+            "name": patient.name,
+            "phone_number": patient.phone_number,
+        })
+    except Exception as e:
+        return handle_tool_error("create_patient", tool_call_id, e)
 
 
 # ---------- Tool 7: get_clinic_information ----------
@@ -268,14 +303,17 @@ async def save_call_summary(request: Request, db: Session = Depends(get_db)):
     if error:
         return vapi_result(tool_call_id, error)
 
-    call_log = appointment_service.save_call_summary(
-        db=db,
-        call_id=req.call_id,
-        caller_number=req.caller_number,
-        patient_id=req.patient_id,
-        call_reason=req.call_reason,
-        summary=req.summary,
-        outcome=req.outcome,
-        appointment_created=req.appointment_created,
-    )
-    return vapi_result(tool_call_id, {"success": True, "call_log_id": call_log.id})
+    try:
+        call_log = appointment_service.save_call_summary(
+            db=db,
+            call_id=req.call_id or tool_call_id,
+            caller_number=req.caller_number,
+            patient_id=req.patient_id,
+            call_reason=req.call_reason,
+            summary=req.summary,
+            outcome=req.outcome,
+            appointment_created=req.appointment_created,
+        )
+        return vapi_result(tool_call_id, {"success": True, "call_log_id": call_log.id})
+    except Exception as e:
+        return handle_tool_error("save_call_summary", tool_call_id, e)
