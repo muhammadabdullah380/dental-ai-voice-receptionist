@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models.appointment import Appointment, CallLog
 from app.integrations.factory import calendar_provider, logging_provider
+from app.services import patient_service
 from app.config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -14,8 +15,6 @@ logger = logging.getLogger("uvicorn.error")
 # Simple in-process lock to prevent double-booking during concurrent requests.
 _booking_lock = threading.Lock()
 
-# Prefer webhook URLs from .env (see README) — fall back to localhost defaults
-# so existing setups keep working even if the .env keys aren't set yet.
 APPOINTMENT_WEBHOOK_URL = getattr(
     settings, "N8N_APPOINTMENT_WEBHOOK_URL", "http://localhost:5678/webhook/appointment-booked"
 )
@@ -37,9 +36,18 @@ def _localize(dt: datetime) -> datetime:
     return dt.astimezone(tz)
 
 
+def _resolve_patient_name(db: Session, patient_id: str) -> str:
+    if not patient_id:
+        return "Unknown"
+    try:
+        patient = patient_service.get_patient_by_id(db, patient_id)
+        return patient.name if patient else patient_id
+    except Exception as e:
+        logger.warning(f"Could not resolve patient name for {patient_id}: {e}")
+        return patient_id
+
+
 def _send_webhook(url: str, payload: dict, label: str):
-    """Best-effort POST to an n8n webhook. Never raises — a down n8n instance
-    should never block a booking/cancellation/call-summary from succeeding."""
     try:
         with httpx.Client(timeout=5.0) as client:
             response = client.post(url, json=payload)
@@ -55,12 +63,12 @@ def _send_webhook(url: str, payload: dict, label: str):
         logger.warning(f"Unexpected error sending n8n {label} webhook: {e}")
 
 
-def _send_appointment_log(appointment, status: str):
+def _send_appointment_log(db: Session, appointment, status: str):
     _send_webhook(
         APPOINTMENT_WEBHOOK_URL,
         {
             "appointment_id": str(appointment.id),
-            "patient_name": appointment.patient_id,
+            "patient_name": _resolve_patient_name(db, appointment.patient_id),
             "appointment_type": appointment.appointment_type,
             "start_time": str(appointment.start_time),
             "status": status,
@@ -131,7 +139,6 @@ def book_appointment(
         except Exception as e:
             db.rollback()
             logger.error(f"Database error while saving appointment for patient {patient_id}: {e}", exc_info=True)
-            # The calendar event was already created — best effort to undo it so we don't leave an orphaned event.
             try:
                 calendar_provider.cancel_event(event_id)
             except Exception as cleanup_error:
@@ -151,7 +158,7 @@ def book_appointment(
     except Exception as e:
         logger.warning(f"logging_provider.log_appointment failed (non-fatal): {e}")
 
-    _send_appointment_log(appointment, "confirmed")
+    _send_appointment_log(db, appointment, "confirmed")
 
     return appointment
 
@@ -207,7 +214,7 @@ def reschedule_appointment(db: Session, appointment_id: str, new_start_time: dat
     except Exception as e:
         logger.warning(f"logging_provider.log_appointment failed (non-fatal): {e}")
 
-    _send_appointment_log(appointment, "rescheduled")
+    _send_appointment_log(db, appointment, "rescheduled")
 
     return appointment
 
@@ -221,9 +228,6 @@ def cancel_appointment(db: Session, appointment_id: str):
         try:
             calendar_provider.cancel_event(appointment.external_event_id)
         except Exception as e:
-            # Log it, but don't block the cancellation in our own system just because
-            # the calendar cleanup failed — a stale calendar event is far less harmful
-            # than telling the patient their cancellation didn't go through.
             logger.error(f"Calendar error while cancelling event for appointment {appointment_id}: {e}", exc_info=True)
 
     try:
@@ -245,7 +249,7 @@ def cancel_appointment(db: Session, appointment_id: str):
     except Exception as e:
         logger.warning(f"logging_provider.log_appointment failed (non-fatal): {e}")
 
-    _send_appointment_log(appointment, "cancelled")
+    _send_appointment_log(db, appointment, "cancelled")
 
     return appointment
 
@@ -259,6 +263,7 @@ def save_call_summary(
     summary: str = None,
     outcome: str = None,
     appointment_created: str = None,
+    call_duration_seconds: int = None,
 ):
     try:
         call_log = CallLog(
@@ -269,6 +274,7 @@ def save_call_summary(
             summary=summary,
             outcome=outcome,
             appointment_created=appointment_created,
+            call_duration_seconds=call_duration_seconds,
         )
         db.add(call_log)
         db.commit()
@@ -289,16 +295,19 @@ def save_call_summary(
     except Exception as e:
         logger.warning(f"logging_provider.log_call_summary failed (non-fatal): {e}")
 
+    patient_name = _resolve_patient_name(db, patient_id)
+
     _send_webhook(
         CALL_SUMMARY_WEBHOOK_URL,
         {
             "call_id": call_id,
             "caller_number": caller_number,
-            "patient_name": patient_id,
+            "patient_name": patient_name,
             "call_reason": call_reason,
             "summary": summary,
             "outcome": outcome,
             "appointment_created": appointment_created,
+            "call_duration_seconds": call_duration_seconds,
             "timestamp": datetime.utcnow().isoformat(),
         },
         label="call summary",

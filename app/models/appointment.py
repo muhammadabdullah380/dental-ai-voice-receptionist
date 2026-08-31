@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, ForeignKey
+from sqlalchemy import Column, String, DateTime, ForeignKey, Integer
 from sqlalchemy.sql import func
 from app.db.database import Base
 
@@ -29,4 +29,5 @@ class CallLog(Base):
     summary = Column(String, nullable=True)
     outcome = Column(String, nullable=True)  # booked|rescheduled|cancelled|faq|no_action
     appointment_created = Column(String, nullable=True)  # yes/no, or appointment_id
+    call_duration_seconds = Column(Integer, nullable=True)  # total call length, sent by Vapi
     created_at = Column(DateTime(timezone=True), server_default=func.now())

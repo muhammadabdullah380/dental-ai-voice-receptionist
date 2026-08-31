@@ -136,6 +136,7 @@ class CallSummaryRequest(BaseModel):
     summary: Optional[str] = None
     outcome: Optional[str] = None
     appointment_created: Optional[str] = None
+    call_duration_seconds: Optional[int] = None
 
 
 # ---------- Tool 1: get_available_slots ----------
@@ -313,6 +314,7 @@ async def save_call_summary(request: Request, db: Session = Depends(get_db)):
             summary=req.summary,
             outcome=req.outcome,
             appointment_created=req.appointment_created,
+            call_duration_seconds=req.call_duration_seconds,
         )
         return vapi_result(tool_call_id, {"success": True, "call_log_id": call_log.id})
     except Exception as e:
