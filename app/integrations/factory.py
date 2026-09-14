@@ -1,3 +1,5 @@
+import logging
+
 from app.config import settings
 from app.integrations.calendar_mock import MockCalendarProvider
 from app.integrations.sheets_mock import MockLoggingProvider
@@ -5,6 +7,8 @@ from app.integrations.calendar_google import GoogleCalendarProvider
 
 # When you build the real one later:
 # from app.integrations.sheets_google import GoogleSheetsProvider
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def get_calendar_provider():
@@ -15,8 +19,9 @@ def get_calendar_provider():
 
 def get_logging_provider():
     if settings.LOGGING_PROVIDER == "sheets":
-        raise NotImplementedError("Wire up GoogleSheetsProvider here once ready")
-        # return GoogleSheetsProvider()
+        logger.warning(
+            "Google Sheets logging is configured but not implemented yet; falling back to mock logging provider."
+        )
     return MockLoggingProvider()
 
 

@@ -99,6 +99,13 @@ def book_appointment(
     appointment_type: str = "General Checkup",
     provider: str = None,
 ):
+    if not patient_id:
+        raise ValueError("Patient ID is required")
+
+    patient = patient_service.get_patient_by_id(db, patient_id)
+    if not patient:
+        raise ValueError("Patient not found. Please create the patient before booking an appointment.")
+
     start_time = _localize(start_time)
     end_time = start_time + timedelta(minutes=settings.APPOINTMENT_DURATION_MIN)
 
